@@ -1,0 +1,450 @@
+---
+title: "Waterkwaliteit datalab"
+author: "Martijn Koole"
+output: html_document
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+```{r setup, include=FALSE, warning=F}
+knitr::opts_chunk$set(echo = TRUE)
+source("lib.R")
+```
+
+## Laad de data en preprocessing
+- De drie datasets zout (watzu), zoet (watze) en zwevende stof (zsto) zijn samengevoegd 
+- Onbetrouwbare waarneming zijn gefilterd (KWC = 99)
+- Georeferentie gemaakt en coordinaten getransformeerd naar WGS84
+- KNMI data geladen en gekoppeld aan waarnemingen, op basis van dichtsbijzijnde meetlocatie.
+
+```{r, cache=T, echo=F, warning=F}
+##*Laad de data & preprocessing. ----
+
+zout<- lapply(list.files("data/watzu2006_2016/"),function(x){fread(paste0("data/watzu2006_2016/",x),stringsAsFactors = TRUE)}) 
+zout<- rbindlist(zout)
+
+zoet<- lapply(list.files("data/watze2006_2016/"),function(x){fread(paste0("data/watze2006_2016/",x),stringsAsFactors = TRUE)}) 
+zoet<- rbindlist(zoet)
+
+zw_stof<- lapply(list.files("data/zsto2006_2016/")[2:3],function(x){fread(paste0("data/zsto2006_2016/",x),stringsAsFactors = TRUE)}) 
+zw_stof<- rbindlist(zw_stof)
+
+data_tot<- rbind(zout,zoet,zw_stof)
+data_tot$WAARDE <- as.numeric(gsub("#+","",data_tot$WAARDE))
+data_tot$DATUM <- as.Date(as.character(data_tot$DATUM),format="%Y%m%d")
+
+#Verwijder kwaliteitscode 99
+data_tot<- data_tot[which(data_tot$KWC <99),]
+#data_tot<- data_tot[which(data_tot$WAARDE < 10^6),]
+data_tot$is_PAK <- ifelse(data_tot$PAR %in% c("Ant","BaA","BaP","BbF","BghiPe","BkF","Chr","DBahAnt",
+                                              "Fen","Flu","InP","Naf","Pyr"),
+                          1,0)
+
+data_tot$ID<- seq.int(nrow(data_tot))
+
+
+##coordinaten naar WGS
+##laad locatiereferentie
+locs<- read.csv("data/RWSlocaties_OWMTYPE_definitief2015.csv",sep=";")
+
+data_tot <- merge(data_tot, locs, by.x = "LOC", by.y = "mpn_mpnident", all.x = T, all.y = F)
+
+data_tot$X_RD <- data_tot$x_coordinaat; data_tot$x_coordinaat <- NULL
+data_tot$Y_RD <- data_tot$y_coordinaat; data_tot$y_coordinaat <- NULL
+
+#sum(is.na(data_tot$X_RD))
+
+tmp<- data_tot[which(data_tot$X_RD>0),]
+coordinates(tmp)<- ~X_RD+Y_RD
+
+rd<- "+proj=sterea +lat_0=52.15616055555555 +lon_0=5.38763888888889 +k=0.9999079 +x_0=155000 +y_0=463000 +ellps=bessel +towgs84=565.417,50.3319,465.552,-0.398957,0.343988,-1.8774,4.0725 +units=m +no_defs "
+
+proj4string(tmp)<- rd
+
+
+tmp<- spTransform(tmp,"+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs" )
+tmp<- as.data.frame(tmp)
+
+data_tot$X_WGS <- tmp$X_RD[match(data_tot$ID,tmp$ID)]
+data_tot$Y_WGS <- tmp$Y_RD[match(data_tot$ID,tmp$ID)]
+rm(tmp)
+
+
+#Er zitten nu allerlei meetgegevens in, we willen weten welke parameters bij welke meetlocaties worden gemeten en voor welke periode.
+
+
+aantal_waarnemingen <- data_tot %>% group_by(LOCOMS,PAROMS,EHD,HDH,BEM) %>% 
+  summarize(n=length(WAARDE),begin_datum = min(DATUM),eind_datum = max(DATUM))
+
+print("Aantal waarnemingen per parameter per meetlocatie. Onderstaand de top 10 parameters met hoogste beschikbaarheid.")
+head(aantal_waarnemingen[order(aantal_waarnemingen$n,decreasing = T),],10)
+
+# *Koppelen weerdata -----
+
+## Laad de data
+
+if(!file.exists("data/knmi_data.txt")){
+  system( "wget -O data/knmi_data.txt --post-data='stns=&vars=&byear=2006&bmonth=1&bday=1&eyear=2016&emonth=12&eday=31'     http://projects.knmi.nl/klimatologie/daggegevens/getdata_dag.cgi")
+}
+
+
+knmi_data<- fread("data/knmi_data.txt", sep = ",",dec=".",skip = 96)
+colnames(knmi_data)<- gsub(" |#","",strsplit(readLines("data/knmi_data.txt",n=98)[98],",")[[1]])
+
+knmi_data$Date <- as.Date(as.character(knmi_data$YYYYMMDD), format = "%Y%m%d")
+
+
+stations<- read.table("data/knmi_aws_coord.csv",sep=",",header = T)
+stations<- stations[!is.na(stations$STN),]
+
+#match dichtsbijzijnde meetlocatie
+meetlocs <- data_tot %>% #group_by(LOCOMS, X_WGS, Y_WGS) %>%
+  distinct(LOCOMS, X_WGS, Y_WGS) 
+
+#kleinste afstanden (euclidisch)
+d<- rdist( cbind(stations$LON.east.,stations$LAT.north.),cbind(meetlocs$X_WGS,meetlocs$Y_WGS))
+mindist <- apply(d, 2, function(x) {if (all(is.na(x))) {NA}  else {which.min(x)} }) 
+
+meetlocs$knmi_STN <- stations$STN[mindist]
+
+data_tot$knmi_STN <- meetlocs$knmi_STN[match(data_tot$LOCOMS,meetlocs$LOCOMS)]
+
+#merge
+data_tot <- merge(data_tot, knmi_data, by.x = c("knmi_STN","DATUM"), by.y = c("STN", "Date"), all.x = T, all.y = F)
+
+rm(d, mindist,stations, meetlocs)
+
+```
+
+## Chlorofyl-a
+
+Een van de vragen vanuit de opdrachtgever is om te focussen op chlorofyl-a, en om bijvoorbeeld relaties met andere parameters te onderzoeken. Hiervoor maken we eerst een dataset met alle chlorofyl-a metingen, gecombineerd op dagniveau met andere metingen van bijvoorbeeld nutrienten.
+
+```{r , cache=T, warning=F}
+#Selecteer nutrienten, PAK's en wat andere mogelijk relevante parameters
+pak <- data_tot[which(data_tot$is_PAK == 1),]
+chloro <- data_tot[which(data_tot$PAROMS %in% c("chlorofyl-a","nitraat","nitriet", "stikstof","orthofosfaat",
+                                                "ammonium","totaal fosfaat", "Zwevende stof", "Temperatuur", "zuurstof", "Doorzicht","Zuurgraad","Kjeldahl stikstof") |
+                     data_tot$is_PAK == 1),]
+
+chloro_wide <- dcast(chloro, 
+                     DATUM + LOCOMS + knmi_STN +TN ~ PAROMS, value.var = "WAARDE", drop = T,fun.aggregate = mean) #dagen met meerdere metingen worden gemiddeld
+
+chloro_wide$month <- as.factor(month(chloro_wide$DATUM))
+
+#verwijder ouliers chlorofyl
+q99 <- quantile(chloro_wide$`chlorofyl-a`,c(0.005, 0.995), na.rm=T) #0.5 en 99.5 percentiel
+
+chloro_wide[which(chloro_wide$`chlorofyl-a`> q99[2]|
+                                   chloro_wide$`chlorofyl-a`< q99[1]),] <- NA
+
+chloro[which(chloro$WAARDE < q99[1] | chloro$WAARDE > q99[2]),] <- NA
+
+
+```
+
+
+### Leaflet
+We plotten de meetlocaties van chlorofyl. De kleurschaal geeft de gemiddelde meetwaarde weer, de grootte van de cirkels de variantie.
+
+```{r, cache = T, echo = F, warning=F}
+#Leaflet
+chl_agg<- chloro %>% filter(PAROMS == "chlorofyl-a") %>% group_by(LOCOMS,X_WGS,Y_WGS, LOC) %>% 
+  summarize(n=length(WAARDE),mean= mean(WAARDE), var = var(WAARDE))
+
+
+
+#leaflet
+colpal1<- colorNumeric('Spectral',domain = chl_agg$mean,reverse = T)
+
+leaflet(chl_agg) %>% addProviderTiles(providers$CartoDB)  %>% 
+  addCircles(lng = chl_agg$X_WGS,lat = chl_agg$Y_WGS,radius =   ~var*50,col=~colpal1(mean),
+             popup = ~LOCOMS
+  ) %>%
+  addLegend("bottomright",bins = 5, pal = colpal1, values=~mean,
+            title = "Gem. meetwaarde",
+            opacity = 0.7)
+
+```
+
+### Correlatiematrix
+Een eerste check t.b.v. correlaties tussen verschillende parameters is een correlatiematrix (alleen voor parameters met hoge beschikbaarheid)
+
+```{r, cache = T, fig.width = 12, fig.height=12, warning=F}
+library(corrplot)
+na<- sapply(chloro_wide, function(y) sum(length(which(is.na(y)))))/nrow(chloro_wide) #beschikbaarheid per parameter
+
+df_cors <- chloro_wide[,which(na <0.2)]
+cors<- cor(chloro_wide[,4:(ncol(chloro_wide)-1)], use = "pairwise.complete.obs")
+
+
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+corrplot(cors, method="color", col=col(200),  
+         type="upper", #order="hclust", 
+         tl.cex = 0.6,
+         number.cex=0.5,
+         cl.cex = 0.6,
+         addCoef.col = "black", # Add coefficient of correlation
+         tl.col="black", tl.srt=45, #Text label color and rotation
+         # Combine with significance
+         #p.mat = p.mat, sig.level = 0.01, insig = "blank", 
+         # hide correlation coefficient on the principal diagonal
+         diag=TRUE
+)
+
+```
+
+### Regressiemodellen
+Met lineaire regressie en een aantal eenvoudige machine learning modellen kijken we vervolgens in hoeverre chrolofyl-a te modelleren is op basis van andere parameters.
+
+Omdat niet alle meetlocaties een hoge beschikbaarheid hebben, selecteren we alleen de top 50 locaties met meeste chlorofyl-a metingen. Daarnaast heeft Marcel tijdens de intake een lijstje met locaties aangeleverd zie sowieso moeten worden meegenomen.
+
+De plot laat de tijdlijn zien voor de geselecteerde locaties
+
+```{r, chache = T, fig.width=12, fig.height=8, warning=F}
+#We kijken alleen naar locaties met hoge beschikbaarheid of locaties uit de lijst in intakeformulier
+
+lijst_marcel <- c("MAASSS","SASVGT","SCHAARVODLL","KEIZVR","NIEUWSS","BRAKL","ANDK","EIJSDPTN","LOBPTN","AMSDM","IJMDN1","KETMWT",
+                  "BOCHTVWTM","HEEL","MARKMMDN","NIEUWGN","NOORDWK2","PUTTHK","SCHEELHK","VROUWZD","WIENE"
+)
+
+locs_top_n <- chl_agg %>% arrange(desc(n)) %>% head(50) 
+
+print(paste(sum(lijst_marcel %in% locs_top_n$LOC), "van de", length(lijst_marcel), "locaties uit de lijst van Marcel zijn geselecteerd. De andere",
+            length(lijst_marcel)-sum(lijst_marcel %in% locs_top_n$LOC),"locaties hebben",
+            paste(chl_agg$n[which(chl_agg$LOC %in% lijst_marcel[which(!(lijst_marcel %in% locs_top_n$LOC))])], collapse = ","), 
+            "observaties en voegen we ook nog toe."
+))
+
+locs <- unique(chl_agg$LOCOMS)[which( unique(chl_agg$LOC) %in% locs_top_n$LOC | unique(chl_agg$LOC) %in% lijst_marcel)]
+
+df <- chloro_wide[which(chloro_wide$LOCOMS %in% locs),]
+
+df <- droplevels(df)
+
+chloro <- chloro[which(chloro$LOCOMS %in% locs),]
+
+
+
+#ggplot(chloro, aes(x = factor(LOCOMS), y= WAARDE)) + geom_boxplot() #+ylim(-1,100)
+
+#ggplot(chloro,aes(x = DATUM, y = WAARDE, color = LOCOMS)) + geom_line(alpha = 0.5) + facet_wrap(~SGB,nrow = 6) +guides(color=F) +ylim(-2,100)
+
+ggplot(chloro,aes(x = DATUM, y = WAARDE, color = LOCOMS)) + geom_line(alpha = 0.5) + facet_wrap(~LOCOMS) +guides(color=F) 
+
+```
+
+We testen eerst een lm model (lineaire regressie), vervolgens een decision tree en een gbm. Het model probeert steeds chlorofyl-a te voorspellen op basis van de andere meetgegevens, locatie en maand.
+
+```{r, cache = T, warning=F}
+###Machine learning pipeline -----
+
+library(caret)
+
+
+#remove na's
+na<- sapply(chloro_wide, function(y) sum(length(which(is.na(y)))))/nrow(chloro_wide)
+
+df_m <- df[,which(na <0.3)]
+
+df_m <- df_m[complete.cases(df_m),]
+
+colnames(df_m) <- gsub(" |-|\\(|\\)|,","", colnames(df_m))
+cols <- colnames(df_m)
+cols <- cols[which(!cols %in% c("chlorofyl-a", "DATUM", "YYYYMMDD", "HDH", "ANA", "na_count"))]
+#cols[which(grepl(" ", cols))] <- paste0("`",cols[which(grepl(" ", cols))], "`" )
+
+formula <- as.formula(paste("chlorofyla ~", paste(cols, collapse = "+")))
+
+# define training control
+train_control <- trainControl(method="repeatedcv", number=5, repeats = 3)
+
+# lineair model
+lm <- train(formula, data=df_m, trControl=train_control, method="lm",na.action = na.pass)
+print(lm)
+summary(lm)
+
+
+#rpart
+rp <- train(formula, data=df_m, trControl=train_control, method="rpart",na.action = na.pass)
+print(rp)
+
+#gbm
+gbm <- train(formula, data=df_m, trControl=train_control, method="gbm", verbose = FALSE)
+print(gbm)
+varImp(gbm)
+```
+
+### Nested model per locatie
+Per locatie kijken we of een model kunnen maken dat chlorofyl-a kan voorspellen in de tijd
+
+```{r}
+#nested lineair model
+
+cols <- cols[which(!cols %in% c("LOCOMS", "knmi_STN"))]
+
+formula_nest <- as.formula(paste("chlorofyla ~", paste(cols, collapse = "+")))
+
+tr <- trainControl(method = "timeslice",initialWindow = 75, horizon = 25, fixedWindow = FALSE)
+
+
+lm_results <- data.frame('loc' = NA, 'n' = NA, 'intercept' = NA, 'RMSE' = NA, "Rsquared" = NA, "MAE" = NA, "RMSESD" = NA, "RsquaredSD" = NA, "MAESD" = NA)
+for (loc in unique(df_m$LOCOMS)){
+  d <- df_m %>% filter(LOCOMS == loc) %>% arrange(DATUM)
+  #train <- d[1:round(nrow(d)*0.7),]
+  #test <- d[(round(nrow(d)*0.7)+1):nrow(d) ,]
+  model <- train(formula_nest, data=d ,train_control = tr,method="lm",na.action = na.pass)
+  
+  lm_results <- rbind(lm_results, cbind(data.frame('loc'= loc, 'n' = nrow(d)), data.frame(model$results)))
+}
+
+lm_results %>% arrange(desc(Rsquared)) 
+plot(model$finalModel)
+
+```
+
+## Doorzicht
+We kunnen hetzelfde doen voor doorzicht.
+
+```{r, cache = T}
+#Selecteer nutrienten, PAK's en wat andere mogelijk relevante parameters
+pak <- data_tot[which(data_tot$is_PAK == 1),]
+doorzicht <- data_tot[which(data_tot$PAROMS %in% c("chlorofyl-a","nitraat","nitriet", "stikstof","orthofosfaat",
+                                                "ammonium","totaal fosfaat", "Zwevende stof", "Temperatuur", "zuurstof", "Doorzicht","Zuurgraad","Kjeldahl stikstof") |
+                     data_tot$is_PAK == 1),]
+
+doorzicht_wide <- dcast(doorzicht, 
+                     DATUM + LOCOMS + knmi_STN +TN ~ PAROMS, value.var = "WAARDE", drop = T,fun.aggregate = mean) #dagen met meerdere metingen worden gemiddeld
+
+doorzicht_wide$month <- as.factor(month(doorzicht_wide$DATUM))
+
+#verwijder ouliers doorzichtfyl
+q99 <- quantile(doorzicht_wide$Doorzicht,c(0.005, 0.995), na.rm=T) #0.5 en 99.5 percentiel
+
+doorzicht_wide[which(doorzicht_wide$Doorzicht> q99[2]|
+                                   doorzicht_wide$Doorzicht< q99[1]),] <- NA
+
+doorzicht[which(doorzicht$WAARDE < q99[1] | doorzicht$WAARDE > q99[2]),] <- NA
+
+```
+
+
+```{r, fig.width = 12, fig.height=12,}
+df_cors <- doorzicht_wide[,which(na <0.2)]
+cors<- cor(doorzicht_wide[,4:(ncol(doorzicht_wide)-1)], use = "pairwise.complete.obs")
+
+
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+corrplot(cors, method="color", col=col(200),  
+         type="upper", #order="hclust", 
+         tl.cex = 0.6,
+         number.cex=0.5,
+         cl.cex = 0.6,
+         addCoef.col = "black", # Add coefficient of correlation
+         tl.col="black", tl.srt=45, #Text label color and rotation
+         # Combine with significance
+         #p.mat = p.mat, sig.level = 0.01, insig = "blank", 
+         # hide correlation coefficient on the principal diagonal
+         diag=TRUE
+)
+```
+
+```{r, chache = T, fig.width=12, fig.height=8, warning=F}
+#We kijken alleen naar locaties met hoge beschikbaarheid of locaties uit de lijst in intakeformulier
+
+doorzicht_agg <- doorzicht %>% filter(PAROMS == "Doorzicht") %>% group_by(LOCOMS,X_WGS,Y_WGS, LOC) %>% 
+  summarize(n=length(WAARDE),mean= mean(WAARDE), var = var(WAARDE))
+
+locs_top_n <- doorzicht_agg %>% arrange(desc(n)) %>% head(50) 
+
+print(paste(sum(lijst_marcel %in% locs_top_n$LOC), "van de", length(lijst_marcel), "locaties uit de lijst van Marcel zijn geselecteerd. De andere",
+            length(lijst_marcel)-sum(lijst_marcel %in% locs_top_n$LOC),"locaties hebben",
+            paste(chl_agg$n[which(chl_agg$LOC %in% lijst_marcel[which(!(lijst_marcel %in% locs_top_n$LOC))])], collapse = ","), 
+            "observaties en voegen we ook nog toe."
+))
+
+locs <- unique(doorzicht_agg$LOCOMS)[which( unique(doorzicht_agg$LOC) %in% locs_top_n$LOC | unique(doorzicht_agg$LOC) %in% lijst_marcel)]
+
+df <- doorzicht_wide[which(doorzicht_wide$LOCOMS %in% locs),]
+
+df <- droplevels(df)
+
+doorzicht <- doorzicht[which(doorzicht$LOCOMS %in% locs),]
+
+
+
+#ggplot(doorzicht, aes(x = factor(LOCOMS), y= WAARDE)) + geom_boxplot() #+ylim(-1,100)
+
+#ggplot(doorzicht,aes(x = DATUM, y = WAARDE, color = LOCOMS)) + geom_line(alpha = 0.5) + facet_wrap(~SGB,nrow = 6) +guides(color=F) +ylim(-2,100)
+
+ggplot(doorzicht,aes(x = DATUM, y = WAARDE, color = LOCOMS)) + geom_line(alpha = 0.5) + facet_wrap(~LOCOMS) +guides(color=F) 
+
+```
+
+```{r}
+#remove na's
+na<- sapply(doorzicht_wide, function(y) sum(length(which(is.na(y)))))/nrow(doorzicht_wide)
+
+df_m2 <- df[,which(na <0.4)]
+
+df_m2 <- df_m2[complete.cases(df_m2),]
+
+colnames(df_m2) <- gsub(" |-|\\(|\\)|,","", colnames(df_m2))
+cols <- colnames(df_m2)
+cols <- cols[which(!cols %in% c("Doorzicht", "DATUM", "YYYYMMDD", "HDH", "ANA", "na_count"))]
+#cols[which(grepl(" ", cols))] <- paste0("`",cols[which(grepl(" ", cols))], "`" )
+
+formula <- as.formula(paste("Doorzicht ~", paste(cols, collapse = "+")))
+
+# define training control
+train_control <- trainControl(method="repeatedcv", number=5, repeats = 3)
+
+# lineair model
+lm <- train(formula, data=df_m2, trControl=train_control, method="lm",na.action = na.pass)
+print(lm)
+summary(lm)
+
+
+#rpart
+rp <- train(formula, data=df_m2, trControl=train_control, method="rpart",na.action = na.pass)
+print(rp)
+
+#gbm
+gbm <- train(formula, data=df_m2, trControl=train_control, method="gbm", verbose = FALSE)
+print(gbm)
+varImp(gbm)
+```
+
+### Nested model per locatie
+Per locatie kijken we of een model kunnen maken dat chlorofyl-a kan voorspellen in de tijd
+
+```{r}
+#nested lineair model
+
+cols <- cols[which(!cols %in% c("LOCOMS", "knmi_STN"))]
+
+formula_nest <- as.formula(paste("Doorzicht ~", paste(cols, collapse = "+")))
+
+tr <- trainControl(method = "timeslice",initialWindow = 75, horizon = 25, fixedWindow = TRUE)
+
+
+lm_results <- data.frame('loc' = NA, 'n' = NA, 'intercept' = NA, 'RMSE' = NA, "Rsquared" = NA, "MAE" = NA, "RMSESD" = NA, "RsquaredSD" = NA, "MAESD" = NA)
+
+for (loc in unique(df_m2$LOCOMS)){
+  d <- df_m2 %>% filter(LOCOMS == loc) %>% arrange(DATUM)
+  #train <- d[1:round(nrow(d)*0.7),]
+  #test <- d[(round(nrow(d)*0.7)+1):nrow(d) ,]
+  model <- train(formula_nest, data=d,train_control = tr,method="lm",na.action = na.pass)
+  
+  lm_results <- rbind(lm_results, cbind(data.frame('loc'= loc, 'n' = nrow(d)), data.frame(model$results)))
+}
+
+lm_results %>% arrange(desc(Rsquared)) 
+
+```
